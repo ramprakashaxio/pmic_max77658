@@ -41,12 +41,66 @@ void max77658_request_software_off(const char *reason)
 K_THREAD_STACK_DEFINE(pmic_stack_area, PMIC_STACK_SIZE);
 struct k_thread pmic_thread_data;
 
-/* --- Configuration Constants --- */
-#define BAT_CAP_MAH         400
-#define BAT_TERM_CURR_MA    20
-#define BAT_V_EMPTY_MV      3000
+/* --- Configuration Constants (60mAh Battery) --- */
+#define BAT_CAP_MAH         60
+#define BAT_TERM_CURR_MA    6
+#define BAT_V_EMPTY_MV      3200
 #define BAT_V_CHARGE_MV     4200
-#define BAT_RSENSE_MOHM     10
+#define BAT_RSENSE_MOHM     50
+
+/* --- Smart Power Cutoff --- */
+#define VBAT_CUTOFF_MV      3200  /* Shutdown threshold */
+#define VBAT_DB_CNT         4     /* 4 * 2s = 8s debounce */
+
+/* --- Helper Functions: Convert Human Units to Register Values --- */
+
+/**
+ * @brief Convert battery capacity (mAh) to DesignCap register value
+ * @param cap_mAh Capacity in milliamp-hours
+ * @param rsense_mohm Sense resistor in milliohms
+ * @return Register value for DESIGNCAP_REG
+ * 
+ * DesignCap LSB = 5.0µVh / Rsense
+ * For 10mΩ: LSB = 0.5mAh per bit → raw = cap / 0.5 = cap * 2
+ * Example: 60mAh → 60 * 10 / 5 = 120 (0x0078)
+ */
+static inline uint16_t fg_designcap_reg(int cap_mAh, int rsense_mohm)
+{
+    return (uint16_t)((cap_mAh * rsense_mohm) / 5);
+}
+
+/**
+ * @brief Convert termination current (mA) to IChgTerm register value
+ * @param iterm_mA Termination current in milliamps
+ * @param rsense_mohm Sense resistor in milliohms
+ * @return Register value for ICHGTERM_REG
+ * 
+ * Current LSB = 1.5625µV / Rsense
+ * For 10mΩ: LSB = 156.25µA per bit
+ * Example: 6mA → (6 * 1000) / 156.25 ≈ 38 (0x0026)
+ */
+static inline uint16_t fg_ichgterm_reg(int iterm_mA, int rsense_mohm)
+{
+    float raw = ((float)iterm_mA * 1000.0f) / (1562.5f / (float)rsense_mohm);
+    return (uint16_t)(raw + 0.5f);
+}
+
+/**
+ * @brief Encode VEmpty register (empty voltage + recovery voltage)
+ * @param ve_mV Empty voltage threshold in millivolts
+ * @param vr_mV Recovery voltage in millivolts
+ * @return Register value for VEMPTY_REG
+ * 
+ * VEmpty[15:7] = VE (empty voltage): LSB = 10mV
+ * VEmpty[6:0] = VR (recovery voltage): LSB = 40mV
+ * Example: 3200mV/3600mV → 0xA05A
+ */
+static inline uint16_t fg_vempty_reg(int ve_mV, int vr_mV)
+{
+    uint16_t ve = (uint16_t)((ve_mV / 10) & 0x01FF);
+    uint16_t vr = (uint16_t)((vr_mV / 40) & 0x007F);
+    return (uint16_t)((ve << 7) | vr);
+}
 
 /* --- Data Structures --- */
 static max77658_pm_t pm_ctx;
@@ -55,7 +109,8 @@ static max77658_fg_t fg_ctx;
 static struct {
     bool fg_ready;
     volatile bool irq_pending;
-} app_state = { false, false };
+    uint8_t vbat_cutoff_cnt;  /* Debounce counter for low voltage */
+} app_state = { false, false, 0 };
 
 /* --- Internal Helpers --- */
 
@@ -69,6 +124,128 @@ static void internal_irq_handler(void *user_data)
 static int sbb_reg_to_mv(uint8_t reg_val)
 {
     return 500 + (reg_val * 25);
+}
+
+/**
+ * @brief Check if USB charger is connected and valid
+ * @return true if CHGIN is valid (not in overvoltage/undervoltage)
+ */
+static bool max77658_is_charger_connected(void)
+{
+    uint8_t stat_chg_b;
+    int ret = bsp_i2c_reg_read(MAX77658_PM_ADDR, MAX77658_STAT_CHG_B, &stat_chg_b, 1);
+    if (ret != 0) {
+        return false; /* I2C error, assume not connected */
+    }
+    
+    /* CHGIN_DTLS[3:2]: 0b11 = Valid input */
+    uint8_t chgin_dtls = (stat_chg_b >> 2) & 0x03;
+    return (chgin_dtls == 3);
+}
+
+/**
+ * @brief Smart power management: debounced low voltage cutoff
+ * 
+ * Uses average cell voltage (immune to pulse artifacts) with 8-second
+ * debounce to prevent shutdown during brief dips. Only shuts down if
+ * charger is not connected.
+ */
+static void max77658_smart_power_check(void)
+{
+    if (!app_state.fg_ready) {
+        return;
+    }
+
+    /* Use AvgVCell for stability (filters out transient dips from PPG pulses) */
+    double vavg_uv = max77658_fg_get_avgVcell(&fg_ctx);
+    int vavg_mv = (int)(vavg_uv / 1000.0);
+    
+    /* Read SOC and current for logging */
+    int soc = max77658_fg_get_SOC(&fg_ctx);
+    float current_uA = max77658_fg_get_Current(&fg_ctx);
+    float current_mA = current_uA / 1000.0f;
+    
+    LOG_INF("Battery: %d%% | %d mV (avg) | %.2f mA", soc, vavg_mv, (double)current_mA);
+
+    /* Cutoff logic: only if NOT charging and voltage is critically low */
+    if (!max77658_is_charger_connected() && vavg_mv <= VBAT_CUTOFF_MV) {
+        app_state.vbat_cutoff_cnt++;
+        LOG_WRN("Low battery: %d mV (count: %d/%d)", vavg_mv, 
+                app_state.vbat_cutoff_cnt, VBAT_DB_CNT);
+        
+        if (app_state.vbat_cutoff_cnt >= VBAT_DB_CNT) {
+            LOG_ERR("!!! CRITICAL LOW BATTERY - ENTERING SHIP MODE !!!");
+            max77658_request_software_off("Battery voltage cutoff");
+        }
+    } else {
+        /* Reset counter if voltage recovers or charger connected */
+        if (app_state.vbat_cutoff_cnt > 0) {
+            LOG_INF("Voltage recovered or charging - reset cutoff counter");
+        }
+        app_state.vbat_cutoff_cnt = 0;
+    }
+}
+
+/**
+ * @brief Diagnostic: Decode raw current register for Rsense calibration
+ * 
+ * Logs raw CURRENT and AVGCURRENT register values and computes the resulting
+ * current in mA for three common Rsense values (10mΩ, 50mΩ, 200mΩ).
+ * 
+ * Compare these values against your bench supply or DMM reading:
+ * - If I@10m matches your meter → set BAT_RSENSE_MOHM = 10
+ * - If I@50m matches your meter → set BAT_RSENSE_MOHM = 50
+ * - If I@200m matches your meter → set BAT_RSENSE_MOHM = 200
+ * 
+ * IMPORTANT: After changing BAT_RSENSE_MOHM, you MUST rebuild to update:
+ * - fg_designcap_reg() calculation
+ * - fg_ichgterm_reg() calculation
+ * - All capacity/current conversion functions
+ */
+static void fg_dump_current_raw(max77658_fg_t *fg)
+{
+    uint16_t raw_u16 = 0, raw_avg_u16 = 0;
+    int ret;
+
+    /* Read raw register values */
+    ret = max77658_fg_read_reg(fg, CURRENT_REG, &raw_u16);
+    if (ret != 0) {
+        LOG_ERR("Failed to read CURRENT_REG");
+        return;
+    }
+    
+    ret = max77658_fg_read_reg(fg, AVGCURRENT_REG, &raw_avg_u16);
+    if (ret != 0) {
+        LOG_ERR("Failed to read AVGCURRENT_REG");
+        return;
+    }
+
+    /* Treat as signed 16-bit (2's complement) */
+    int16_t raw = (int16_t)raw_u16;
+    int16_t raw_avg = (int16_t)raw_avg_u16;
+
+    /* Compute current for different Rsense values */
+    /* Formula: I(mA) = raw × (1562.5 µV / Rsense_mΩ) / 1000 */
+    float i10  = ((float)raw * 1562.5f) / 10.0f  / 1000.0f;   // Rsense = 10mΩ
+    float i50  = ((float)raw * 1562.5f) / 50.0f  / 1000.0f;   // Rsense = 50mΩ
+    float i200 = ((float)raw * 1562.5f) / 200.0f / 1000.0f;  // Rsense = 200mΩ
+
+    LOG_INF("=== RSENSE CALIBRATION ===");
+    LOG_INF("FG Inst Current: raw=0x%04X (%d decimal)", raw_u16, raw);
+    LOG_INF("  @ 10mΩ:  %.2f mA", (double)i10);
+    LOG_INF("  @ 50mΩ:  %.2f mA", (double)i50);
+    LOG_INF("  @ 200mΩ: %.2f mA", (double)i200);
+
+    float a10  = ((float)raw_avg * 1562.5f) / 10.0f  / 1000.0f;
+    float a50  = ((float)raw_avg * 1562.5f) / 50.0f  / 1000.0f;
+    float a200 = ((float)raw_avg * 1562.5f) / 200.0f / 1000.0f;
+
+    LOG_INF("FG Avg Current:  raw=0x%04X (%d decimal)", raw_avg_u16, raw_avg);
+    LOG_INF("  @ 10mΩ:  %.2f mA", (double)a10);
+    LOG_INF("  @ 50mΩ:  %.2f mA", (double)a50);
+    LOG_INF("  @ 200mΩ: %.2f mA", (double)a200);
+    LOG_INF("Compare against your DMM/bench supply reading!");
+    LOG_INF("==========================");
 }
 
 /* Log System Status (Voltage, Current, Errors) */
@@ -89,18 +266,12 @@ static void log_status(void)
     ret = max77658_pm_get_CHG_DTLS(&pm_ctx);
     if (ret >= 0) LOG_INF("Charger State: 0x%X", ret);
 
-    /* 3. Fuel Gauge */
+    /* 3. Fuel Gauge - delegated to smart_power_check() */
+    max77658_smart_power_check();
+    
+    /* 3.1. Rsense Calibration Diagnostic (compare against bench supply) */
     if (app_state.fg_ready) {
-        int soc = max77658_fg_get_SOC(&fg_ctx);
-        int vcell = max77658_fg_get_Vcell(&fg_ctx); 
-        float current = max77658_fg_get_Current(&fg_ctx);
-        
-        if (soc >= 0) {
-            /* Convert uV to mV for cleaner logs */
-            LOG_INF("Battery: %d%% | %d mV | %.2f mA", soc, vcell / 1000, (double)current);
-        }
-    } else {
-        LOG_INF("Battery: FG Not Initialized");
+        fg_dump_current_raw(&fg_ctx);
     }
 
     /* 4. Rail Voltages */
@@ -396,20 +567,31 @@ int max77658_app_init(void)
     /* VERIFY: Dump ALL rail registers to confirm exact voltages */
     debug_dump_all_rail_registers();
 
-    /* 7. Configure Charger */
-    // 200mA Fast Charge, 4.2V, 22.5mA Term
-    max77658_pm_set_CHG_CC(&pm_ctx, 0x19);
-    max77658_pm_set_CHG_CV(&pm_ctx, 0x18);
-    max77658_pm_set_I_TERM(&pm_ctx, 0x02);
-    max77658_pm_set_CHG_EN(&pm_ctx, 0x01);
+    /* 7. Configure Charger for 60mAh Battery */
+    /* Target: 0.8C = 48mA, closest setting is 45mA (Code 0x05) */
+    max77658_pm_set_CHG_CC(&pm_ctx, 0x05);        /* 45mA charge current */
+    max77658_pm_set_CHG_CV(&pm_ctx, 0x18);        /* 4.2V charge voltage */
+    max77658_pm_set_I_TERM(&pm_ctx, 0x02);        /* 10% termination (4.5mA) */
+    max77658_pm_set_CHG_EN(&pm_ctx, 0x01);        /* Enable charger */
 
-    /* 8. Initialize Fuel Gauge */
-    LOG_INF("Initializing Fuel Gauge...");
-    fg_ctx.pdata.designcap = BAT_CAP_MAH;
-    fg_ctx.pdata.ichgterm = BAT_TERM_CURR_MA;
-    fg_ctx.pdata.vempty = BAT_V_EMPTY_MV;
-    fg_ctx.pdata.vcharge = BAT_V_CHARGE_MV;
-    fg_ctx.pdata.rsense = BAT_RSENSE_MOHM;
+    /* 8. Initialize Fuel Gauge with Register-Coded Values */
+    LOG_INF("Initializing Fuel Gauge for 60mAh battery...");
+    
+    /* CRITICAL: Store register values, not human units! */
+    /* config_option_1() writes these directly to hardware registers */
+    fg_ctx.pdata.designcap = fg_designcap_reg(BAT_CAP_MAH, BAT_RSENSE_MOHM);   /* 0x0258 (600) for 60mAh @ 50mΩ */
+    fg_ctx.pdata.ichgterm  = fg_ichgterm_reg(BAT_TERM_CURR_MA, BAT_RSENSE_MOHM); /* 0x00C0 (192) for 6mA @ 50mΩ */
+    fg_ctx.pdata.vempty    = fg_vempty_reg(3200, 3600);  /* 0xA05A (VE=3.2V, VR=3.6V) */
+    fg_ctx.pdata.vcharge   = BAT_V_CHARGE_MV;     /* 4200 (used for MODELCFG selection) */
+    fg_ctx.pdata.rsense    = BAT_RSENSE_MOHM;     /* 50mΩ */
+
+    /* Diagnostic: Verify computed register values before init */
+    LOG_INF("FG Config (Rsense=%dmΩ): DesignCap=0x%04X, DQACC=0x%04X, IChgTerm=0x%04X, VEmpty=0x%04X",
+            fg_ctx.pdata.rsense,
+            fg_ctx.pdata.designcap,
+            (uint16_t)(fg_ctx.pdata.designcap >> 5),
+            fg_ctx.pdata.ichgterm,
+            fg_ctx.pdata.vempty);
 
     ret = max77658_fg_init(&fg_ctx);
     if (ret != 0) {
@@ -487,7 +669,7 @@ void pmic_thread_entry(void *p1, void *p2, void *p3)
             process_interrupt();
         }
         
-        /* Log Status */
+        /* Log Status (includes smart power check) */
         log_status();
         
         k_mutex_unlock(&i2c_lock);

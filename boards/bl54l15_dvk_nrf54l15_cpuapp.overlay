@@ -75,8 +75,11 @@
         reset-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
         mfio-gpios  = <&gpio1 13 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
         
-        /* Configuration */
-        spo2-calib = <1748 6062 10754>;
+        /* PATCH: Use Standard Maxim Coefficients (Scaled x100,000) */
+        /* A = 1.5958422   -> 159584 */
+        /* B = -34.6596622 -> -3465966 */
+        /* C = 112.6898759 -> 11268987 */
+        spo2-calib = <159584 (-3465966) 11268987>;
         hr-config = <4 1>;
         spo2-config = <4 1>;
         use-max86174;

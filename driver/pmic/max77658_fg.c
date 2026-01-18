@@ -13,6 +13,11 @@
 
 LOG_MODULE_REGISTER(max77658_fg, CONFIG_PMIC_MAX77658_LOG_LEVEL);
 
+/* Force EZ Config Override (for development/parameter changes) */
+#ifndef CONFIG_FG_FORCE_EZ_CONFIG
+#define CONFIG_FG_FORCE_EZ_CONFIG 0
+#endif
+
 /* POR Mask */
 #define MAX17055_POR_MASK               (0xFFFD)
 #define MAX17055_CYCLE_MASK             (0x0002)
@@ -135,8 +140,17 @@ int max77658_fg_init(max77658_fg_t *ctx)
    LOG_INF("max77658_fg_init() version: %d", version);
     
    ///STEP 0. Check for POR 
-   if (max77658_fg_check_POR_func(ctx) == F_ERROR_5) {
-       LOG_WRN("No POR detected - Device already initialized? Continuing anyway...");
+   int por_status = max77658_fg_check_POR_func(ctx);
+   
+   if (por_status == F_ERROR_5 && !CONFIG_FG_FORCE_EZ_CONFIG) {
+       LOG_INF("No POR detected - skipping EZ config (preserving learned params)");
+       return F_SUCCESS_0;
+   }
+
+   if (por_status == F_ERROR_5 && CONFIG_FG_FORCE_EZ_CONFIG) {
+       LOG_WRN("No POR, but FORCE_EZ_CONFIG enabled -> reprogramming FG registers");
+   } else {
+       LOG_INF("POR detected - performing full EZ config initialization");
    }
 
    ///STEP 1. Check if FStat.DNR == 0 (Do not continue until FSTAT.DNR == 0)
@@ -568,27 +582,42 @@ int max77658_fg_lsb_to_uvolts(uint16_t lsb)
 }
 
 /**
- * @brief        raw_current_to_uamp Conversion Function
+ * @brief        raw_current_to_uamps Conversion Function
+ * @param curr Raw 16-bit current register value (signed)
+ * @param rsense_mohm Sense resistor value in milliohms
+ * @return Current in microamps (µA)
+ * 
+ * Current register is signed 2's complement.
+ * LSB = 1.5625µV / Rsense
+ * For 50mΩ: LSB = 31.25µA per bit
+ * Formula: Current(µA) = raw × (1562.5 / Rsense_mΩ)
  */
-float max77658_fg_raw_current_to_uamps(uint32_t curr, int rsense_value)
+float max77658_fg_raw_current_to_uamps(uint32_t curr, int rsense_mohm)
 {
-    int16_t res = (int16_t)curr; // Cast to signed 16-bit to handle 2's complement
-    float final_res;
-    
-    final_res = (float)res;
-    final_res *= 1562500.0f /(float)(rsense_value * 10000);
+    int16_t raw = (int16_t)curr; /* Treat as signed 16-bit */
+    if (rsense_mohm <= 0) rsense_mohm = 50; /* Safety default */
 
-    return final_res;
+    /* Current(µA) = raw × (1562.5 / Rsense_mΩ) */
+    return ((float)raw * 1562.5f) / (float)rsense_mohm;
 }
 
 /**
  * @brief        raw_cap_to_uAh Conversion Function
+ * @param raw_cap Raw capacity register value
+ * @param rsense_mohm Sense resistor value in milliohms
+ * @return Capacity in microamp-hours (µAh)
+ * 
+ * Capacity LSB = 5.0µVh / Rsense
+ * For 50mΩ: LSB = 100µAh per bit
+ * Formula: Capacity(µAh) = raw × (5000 / Rsense_mΩ)
  */
-int max77658_fg_raw_cap_to_uAh(uint32_t raw_cap, int rsense_value)
+int max77658_fg_raw_cap_to_uAh(uint32_t raw_cap, int rsense_mohm)
 {
-    int res = raw_cap ;
-    res *=  5000000/(rsense_value * 1000000);
-    return res;
+    if (rsense_mohm <= 0) rsense_mohm = 50; /* Safety default */
+
+    /* Capacity(µAh) = raw × (5000 / Rsense_mΩ) */
+    float uAh = ((float)raw_cap * 5000.0f) / (float)rsense_mohm;
+    return (int)(uAh + 0.5f); /* Round to nearest integer */
 }
 
 /**
