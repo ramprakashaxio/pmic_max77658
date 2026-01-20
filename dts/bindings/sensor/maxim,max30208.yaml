@@ -1,0 +1,8 @@
+description: MAX30208 Digital Temperature Sensor
+compatible: "maxim,max30208"
+include: i2c-device.yaml
+
+properties:
+    addr-gpios:
+      type: phandle-array
+      description: GPIO pins (GPIO0, GPIO1) used to set the I2C address.

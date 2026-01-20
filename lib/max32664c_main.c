@@ -13,6 +13,7 @@
 #include "max32664c_main.h" /* Public API Header */
 #include "app_i2c_lock.h"   /* If you use a global I2C lock */
 #include "max77658_main.h"  /* PMIC Software Off API */
+#include "data_manager.h"
 
 LOG_MODULE_REGISTER(max32664c_app, LOG_LEVEL_INF);
 
@@ -192,6 +193,19 @@ void sensor_app_thread_entry(void *p1, void *p2, void *p3)
         sensor_channel_get(sensor, SENSOR_CHAN_MAX32664C_HEARTRATE, &hr);
         sensor_channel_get(sensor, SENSOR_CHAN_MAX32664C_BLOOD_OXYGEN_SATURATION, &spo2);
         sensor_channel_get(sensor, SENSOR_CHAN_MAX32664C_RESPIRATION_RATE, &rr);
+
+        /* --- NEW: Push Data in ALL States --- */
+        /* Use 10 samples -> 1 batch for continuous streaming */
+        data_manager_set_batch_target(BATCH_SIZE); 
+
+        /* Pass 'current_state' or a specific mode flag as the first arg if you want to track state context */
+        data_manager_push_vitals(
+            (uint8_t)MAX32664C_ALGO_MODE_CONT_HR_CONT_SPO2, /* Or dynamically: (current_state == STATE_D_MEASURING ? 2 : 1) */
+            (uint16_t)hr.val1,   (uint8_t)hr.val2,           /* HR + HR Conf */
+            (uint16_t)spo2.val1, (uint8_t)spo2.val2,         /* SpO2 + SpO2 Conf */
+            (uint16_t)rr.val1,   (uint8_t)skin.val1
+        );
+        /* ------------------------------------ */
 
         /* C. State Machine Logic */
         switch (current_state) {

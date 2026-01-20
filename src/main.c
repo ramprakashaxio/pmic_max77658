@@ -6,10 +6,14 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/sys/util.h>
+#include <stdlib.h>
 
 /* Application Libraries */
 #include "max77658_main.h"
 #include "max32664c_main.h"
+#include "max30208_main.h"
+#include "lsm6dsv32x_main.h"
 #include "app_i2c_lock.h"
 
 /* BLE Store-and-Forward Thread */
@@ -73,23 +77,54 @@ int main(void)
         while (1) { k_msleep(1000); }
     }
 
-    /* 2. Start Application Threads */
+    /* 2. Initialize MAX30208 Temperature Sensor */
+    LOG_INF("Initializing MAX30208...");
+    k_mutex_lock(&i2c_lock, K_FOREVER);
+    ret = max30208_app_init();
+    k_mutex_unlock(&i2c_lock);
+    
+    if (ret != 0) {
+        LOG_WRN("MAX30208 Init Failed (ret=%d) - sensor disabled", ret);
+    }
+
+    /* 3. Start Application Threads */
     /* The internal driver init for max32664c is handled by the sensor thread */
     LOG_INF("Starting Application Threads...");
     max77658_app_start();    /* Starts PMIC thread (Priority 7, 2000ms polling) */
     max32664c_app_start();   /* Starts Sensor thread (Priority 5, 40ms polling) */
+    lsm6dsv32x_start();      /* Starts IMU thread (Priority 6, 40ms polling) */
 
-    /* 3. Main thread runs I2C scanner in loop */
+    /* 4. Main thread runs I2C scanner and temperature monitoring */
     LOG_INF("Main thread starting I2C scanner loop.");
     while (1) {
         k_sleep(K_SECONDS(5));
 
         if (max77658_shutdown_requested()) {
-            LOG_WRN("Shutdown requested; skipping I2C scan.");
+            LOG_WRN("Shutdown requested; skipping diagnostics.");
             continue;
         }
 
+        /* Read MAX30208 temperature */
+        if (max30208_app_dev() != NULL) {
+            int32_t t_x100 = 0;
+            int16_t raw = 0;
+            
+            k_mutex_lock(&i2c_lock, K_FOREVER);
+            ret = max30208_app_read_c_x100(&t_x100, &raw);
+            k_mutex_unlock(&i2c_lock);
+            
+            if (ret == 0) {
+                LOG_INF("MAX30208: raw=%d  temp=%d.%02d C",
+                        raw, (int)(t_x100/100), (int)abs(t_x100%100));
+            } else {
+                LOG_ERR("MAX30208 read failed: %d", ret);
+            }
+        }
+
+        /* I2C bus scan (debug only - disable in production) */
+#if defined(NESO_I2C_SCAN_DEBUG)
         i2c_scan();
+#endif
     }
 
     return 0;

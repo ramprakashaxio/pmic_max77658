@@ -15,9 +15,9 @@
  *   PMIC_nIRQ: P1.06
  *   PMIC_nRST: P1.05
  *
- * UART Pins:
- *   TX: P1.08
- *   RX: P1.09
+ * UART Pins (NFC pins released as GPIO):
+ *   TX: P1.02
+ *   RX: P1.03
  */
 &pinctrl {
     /* I2C21 pins */
@@ -38,21 +38,18 @@
         };
     };
 
-    /* UART configured for external FTDI on P1.08/09 */
+    /* UART configured on P1.02/P1.03 (NFC pins released as GPIO) */
     uart20_default: uart20_default {
         group1 {
-            psels = <NRF_PSEL(UART_TX, 1, 8)>;   /* P1.08 = TX */
-        };
-        group2 {
-            psels = <NRF_PSEL(UART_RX, 1, 9)>;   /* P1.09 = RX */
-            bias-pull-up;
+            psels = <NRF_PSEL(UART_TX, 1, 2)>,  /* P1.02 = TX */
+                    <NRF_PSEL(UART_RX, 1, 3)>;  /* P1.03 = RX */
         };
     };
 
     uart20_sleep: uart20_sleep {
         group1 {
-            psels = <NRF_PSEL(UART_TX, 1, 8)>,   /* P1.08 = TX */
-                    <NRF_PSEL(UART_RX, 1, 9)>;   /* P1.09 = RX */
+            psels = <NRF_PSEL(UART_TX, 1, 2)>,  /* P1.02 = TX */
+                    <NRF_PSEL(UART_RX, 1, 3)>;  /* P1.03 = RX */
             low-power-enable;
         };
     };
@@ -99,6 +96,39 @@
         reg = <0x48>; 
         irq-gpios = <&gpio1 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
     };
+
+    /* MAX30208 Digital Temperature Sensor 
+     * Address pins P1.08/P1.09 forced LOW in firmware via SYS_INIT
+     * to ensure device responds at 0x50
+     */
+    max30208: max30208@50 {
+        compatible = "maxim,max30208";
+        reg = <0x50>;
+        status = "okay";
+    };
+
+    /* LSM6DSO32X 6-axis IMU (3D accelerometer + 3D gyroscope)
+     * INT1: P1.10 (data ready interrupt - active-high)
+     */
+    lsm6dsv32x: imu@6a {
+        compatible = "st,lsm6dsv32x";
+        reg = <0x6a>;
+        status = "okay";
+
+        /* Optional interrupts */
+        int1-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+        /* int2-gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>; */
+    };
+};
+
+/* Force IMU into I2C mode: CS must be HIGH (your CS/I2C-select is P2.00) */
+&gpio2 {
+    imu_cs_i2c_sel: imu_cs_i2c_sel {
+        gpio-hog;
+        gpios = <0 GPIO_ACTIVE_HIGH>; /* P2.00 */
+        output-high;
+        line-name = "IMU_CS_I2C_SEL";
+    };
 };
 
 /* Configure UART20 for debug console (115200 baud) */
@@ -114,6 +144,11 @@
     status = "disabled";
 };
 
+/* Disable NFC to release P1.02 and P1.03 as GPIO pins */
+&uicr {
+    nfct-pins-as-gpios;
+};
+
 /* GPIO definitions for Manual Control / Aliases */
 / {
     chosen {
@@ -123,6 +158,14 @@
     /* PMIC GPIO definitions */
     pmic_gpios {
         compatible = "gpio-keys";
+        
+        /* Optional: expose IMU INT2 as a GPIO input for your app logic
+         * INT2: P0.03 (not used by Zephyr lsm6dso driver directly)
+         */
+        imu_int2: imu_int2 {
+            gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
+            label = "IMU INT2";
+        };
         
         pmic_nirq: pmic_nirq {
             gpios = <&gpio1 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
@@ -163,6 +206,11 @@
         
         /* MAX32664C aliases */
         hub-oe = &hub_oe;
+        
+        /* IMU aliases */
+        imu0 = &lsm6dsv32x;
+        lsm6dso32x = &lsm6dsv32x;  /* Keep old alias for compatibility */
+        imu-int2 = &imu_int2;
     };
 };
 

@@ -4,6 +4,9 @@
 #include <zephyr/fs/nvs.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/devicetree.h>
+#include <errno.h>
+#include <string.h>
 
 #include "storage_manager.h"
 
@@ -11,114 +14,199 @@ LOG_MODULE_REGISTER(storage_mgr, LOG_LEVEL_INF);
 
 static struct nvs_fs fs;
 
-/* * We use the label 'storage' defined in the overlay.
- */
 #define STORAGE_NODE DT_NODE_BY_FIXED_PARTITION_LABEL(storage)
 
-#define MAX_STORED_BATCHES 200 
-#define KEY_WRITE_IDX 1
-#define KEY_READ_IDX  2
-#define KEY_DATA_BASE 100 
+/* * PARTITION: 32KB (0x8000)
+ * SAFE CAPACITY: ~15KB of raw data (due to NVS wear-leveling overhead)
+ * 15KB / ~260 bytes per batch = ~57 batches.
+ * Rounding down to 50 for safety.
+ */
+#define MAX_STORED_BATCHES 50  /* Approx 20 seconds of buffer */
 
-static uint16_t write_idx = 0;
-static uint16_t read_idx = 0;
+enum {
+    STORAGE_PART_BYTES = DT_REG_SIZE(STORAGE_NODE)
+};
+
+#define KEY_WRITE_IDX  1
+#define KEY_READ_IDX   2
+#define KEY_DATA_BASE  100
+
+static uint16_t write_idx;
+static uint16_t read_idx;
+static bool storage_ready;
+
+static struct k_mutex st_lock;
+
+/* Helper to wrap index */
+static inline uint16_t next_idx(uint16_t idx)
+{
+    return (uint16_t)((idx + 1U) % (uint16_t)MAX_STORED_BATCHES);
+}
+
+uint16_t storage_pending_count(void)
+{
+    uint16_t pending;
+
+    k_mutex_lock(&st_lock, K_FOREVER);
+    if (write_idx >= read_idx) {
+        pending = (uint16_t)(write_idx - read_idx);
+    } else {
+        pending = (uint16_t)((uint16_t)MAX_STORED_BATCHES - read_idx + write_idx);
+    }
+    k_mutex_unlock(&st_lock);
+
+    return pending;
+}
+
+bool storage_has_data(void)
+{
+    bool has;
+
+    k_mutex_lock(&st_lock, K_FOREVER);
+    has = (read_idx != write_idx);
+    k_mutex_unlock(&st_lock);
+
+    return has;
+}
 
 int storage_init(void)
 {
     int rc;
     struct flash_pages_info info;
 
-    /* * FIX: We explicitly grab the system flash controller.
-     * The macro FIXED_PARTITION_DEVICE() fails on nRF54L15 because 
-     * the RRAM controller hierarchy confuses the build system.
-     */
+    k_mutex_init(&st_lock);
+    storage_ready = false;
+    write_idx = 0;
+    read_idx = 0;
+
     fs.flash_device = DEVICE_DT_GET(DT_CHOSEN(zephyr_flash_controller));
-    
     if (!device_is_ready(fs.flash_device)) {
         LOG_ERR("Flash device not ready");
-        return -1;
+        return -ENODEV;
     }
 
-    /* * FIX: We get the address offset manually.
-     * This bypasses the broken parent-lookup macros.
-     */
     fs.offset = DT_REG_ADDR(STORAGE_NODE);
-    
-    /* Get sector info to align writes correctly */
+
     rc = flash_get_page_info_by_offs(fs.flash_device, fs.offset, &info);
     if (rc) {
-        LOG_ERR("Unable to get page info");
+        LOG_ERR("Unable to get page info: %d", rc);
         return rc;
     }
 
     fs.sector_size = info.size;
-    fs.sector_count = 4; /* Use 4 sectors for NVS management */
+    fs.sector_count = STORAGE_PART_BYTES / info.size;
+
+    if (fs.sector_count < 2) {
+        LOG_ERR("Storage partition too small: bytes=%d sector=%d count=%d",
+                STORAGE_PART_BYTES, (int)fs.sector_size, (int)fs.sector_count);
+        return -EINVAL;
+    }
 
     rc = nvs_mount(&fs);
     if (rc) {
-        LOG_ERR("NVS Mount failed: %d", rc);
+        LOG_ERR("NVS mount failed: %d (check partition label/size)", rc);
         return rc;
     }
 
-    /* Restore Indices (Persistence Check) */
-    if (nvs_read(&fs, KEY_WRITE_IDX, &write_idx, sizeof(write_idx)) <= 0) write_idx = 0;
-    if (nvs_read(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx)) <= 0) read_idx = 0;
+    /* Restore indices */
+    if (nvs_read(&fs, KEY_WRITE_IDX, &write_idx, sizeof(write_idx)) <= 0) {
+        write_idx = 0;
+    }
+    if (nvs_read(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx)) <= 0) {
+        read_idx = 0;
+    }
 
-    LOG_INF("Storage Init. Pending Batches: %d", 
-        (write_idx >= read_idx) ? (write_idx - read_idx) : (MAX_STORED_BATCHES - read_idx + write_idx));
-    
+    /* Clamp indices to current ring size */
+    write_idx %= (uint16_t)MAX_STORED_BATCHES;
+    read_idx  %= (uint16_t)MAX_STORED_BATCHES;
+
+    storage_ready = true;
+
+    LOG_INF("Storage: partition=%dB page=%dB sectors=%d, batch_size=%uB, ring=%d",
+            STORAGE_PART_BYTES, (int)fs.sector_size, (int)fs.sector_count,
+            (unsigned)sizeof(patient_batch_t), (int)MAX_STORED_BATCHES);
+
+    LOG_INF("Storage: pending=%u (read=%u write=%u)", storage_pending_count(), read_idx, write_idx);
+
     return 0;
 }
 
 int storage_save_batch(const patient_batch_t *batch)
 {
     int rc;
-    uint16_t next_write_idx = (write_idx + 1) % MAX_STORED_BATCHES;
+    uint16_t saved_at;
+    uint16_t next_write;
 
-    /* Handle Ring Buffer Overflow */
-    if (next_write_idx == read_idx) {
-        LOG_WRN("Storage Full! Overwriting oldest data.");
-        read_idx = (read_idx + 1) % MAX_STORED_BATCHES;
-        nvs_write(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx));
+    if (!storage_ready) return -EACCES;
+
+    k_mutex_lock(&st_lock, K_FOREVER);
+
+    next_write = next_idx(write_idx);
+
+    /* Overflow: drop oldest */
+    if (next_write == read_idx) {
+        read_idx = next_idx(read_idx);
+        (void)nvs_write(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx));
     }
 
-    /* Save Data */
-    rc = nvs_write(&fs, KEY_DATA_BASE + write_idx, batch, sizeof(patient_batch_t));
+    saved_at = write_idx;
+
+    rc = nvs_write(&fs, KEY_DATA_BASE + saved_at, batch, sizeof(patient_batch_t));
     if (rc < 0) {
-        LOG_ERR("Flash Write Failed: %d", rc);
+        k_mutex_unlock(&st_lock);
+        LOG_ERR("NVS write failed: %d", rc);
         return rc;
     }
 
-    /* Update Pointer */
-    write_idx = next_write_idx;
-    nvs_write(&fs, KEY_WRITE_IDX, &write_idx, sizeof(write_idx));
-    
-    LOG_INF("Saved batch to NVM (Idx: %d)", write_idx);
+    write_idx = next_write;
+    (void)nvs_write(&fs, KEY_WRITE_IDX, &write_idx, sizeof(write_idx));
+
+    k_mutex_unlock(&st_lock);
     return 0;
 }
 
-int storage_get_next_batch(patient_batch_t *batch)
+int storage_peek_next_batch(patient_batch_t *batch)
 {
-    if (read_idx == write_idx) return -1; /* Empty */
+    int rc;
 
-    /* Read Oldest */
-    int rc = nvs_read(&fs, KEY_DATA_BASE + read_idx, batch, sizeof(patient_batch_t));
-    if (rc <= 0) {
-        LOG_ERR("Flash Read Failed (Idx: %d)", read_idx);
-        /* Skip corrupt entry to prevent lockup */
-        read_idx = (read_idx + 1) % MAX_STORED_BATCHES;
-        nvs_write(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx));
-        return -1;
+    if (!storage_ready) return -EACCES;
+
+    /* Don’t hold lock longer than needed. */
+    k_mutex_lock(&st_lock, K_FOREVER);
+
+    if (read_idx == write_idx) {
+        k_mutex_unlock(&st_lock);
+        return -ENODATA;
     }
 
-    /* Advance Pointer (Delete) */
-    read_idx = (read_idx + 1) % MAX_STORED_BATCHES;
-    nvs_write(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx));
+    rc = nvs_read(&fs, KEY_DATA_BASE + read_idx, batch, sizeof(patient_batch_t));
+    if (rc <= 0) {
+        /* Corrupt entry: skip it so we don’t get stuck forever */
+        LOG_WRN("NVS read failed at idx=%u, skipping entry", read_idx);
+        read_idx = next_idx(read_idx);
+        (void)nvs_write(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx));
+        k_mutex_unlock(&st_lock);
+        return -EIO;
+    }
 
+    k_mutex_unlock(&st_lock);
     return 0;
 }
 
-bool storage_has_data(void)
+int storage_drop_next_batch(void)
 {
-    return (read_idx != write_idx);
+    if (!storage_ready) return -EACCES;
+
+    k_mutex_lock(&st_lock, K_FOREVER);
+
+    if (read_idx == write_idx) {
+        k_mutex_unlock(&st_lock);
+        return -ENODATA;
+    }
+
+    read_idx = next_idx(read_idx);
+    (void)nvs_write(&fs, KEY_READ_IDX, &read_idx, sizeof(read_idx));
+
+    k_mutex_unlock(&st_lock);
+    return 0;
 }

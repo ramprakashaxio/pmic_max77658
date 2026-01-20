@@ -8,6 +8,7 @@
 #include <math.h>
 
 #include "max77658_main.h"
+#include "data_manager.h"
 #include "bsp.h"
 #include "pmic_gpio.h"
 #include "max77658_pm.h"
@@ -164,6 +165,16 @@ static void max77658_smart_power_check(void)
     int soc = max77658_fg_get_SOC(&fg_ctx);
     float current_uA = max77658_fg_get_Current(&fg_ctx);
     float current_mA = current_uA / 1000.0f;
+    
+    uint8_t chg_present = max77658_is_charger_connected() ? 1 : 0;
+
+    /* current in 0.1mA (signed) with clamp */
+    float i_x10_f = current_mA * 10.0f;
+    if (i_x10_f >  32767.0f) i_x10_f =  32767.0f;
+    if (i_x10_f < -32768.0f) i_x10_f = -32768.0f;
+    int16_t batt_ma_x10 = (int16_t)i_x10_f;
+
+    data_manager_update_batt((uint8_t)soc, (uint16_t)vavg_mv, batt_ma_x10, chg_present, true);
     
     LOG_INF("Battery: %d%% | %d mV (avg) | %.2f mA", soc, vavg_mv, (double)current_mA);
 
