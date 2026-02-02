@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(pmic_2512_nrf54)
+project(bm_eso_v1_0)
 
 # Application sources
 target_sources(app PRIVATE 
